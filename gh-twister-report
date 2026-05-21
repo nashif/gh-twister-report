@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+"""
+gh twister-report — gh CLI extension for Zephyr twister CI artifacts.
+
+Downloads artifacts from the twister workflow (twister.json and twister.xml
+files), merges them into a single combined JSON file, and generates a failure
+report using the same analysis logic as scripts/ci/twister_report_analyzer.py.
+
+Installation (from the Zephyr repo root):
+    gh extension install ./scripts/ci/gh-twister-report
+
+Usage examples:
+    # Report for a specific workflow run ID
+    gh twister-report --run-id 1234567890
+
+    # Report for the latest twister run on a PR
+    gh twister-report --pr 12345
+
+    # Report for the latest twister run on a branch
+    gh twister-report --branch main
+
+    # Report using already-downloaded artifacts (skip download)
+    gh twister-report --no-download --artifacts-dir ./my-artifacts
+
+    # Full verbose report saved to a custom file
+    gh twister-report --run-id 1234567890 --long-summary --output report.json
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import zipfile
+from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+WORKFLOW_FILE = "twister.yaml"
+ARTIFACT_NAME_PREFIX = "Unit Test Results"
+
+
+# ---------------------------------------------------------------------------
+# Inline analysis logic (mirrors scripts/ci/twister_report_analyzer.py)
+# so the extension works without needing to locate the Zephyr source tree.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TestCollection:
+    quantity: int = 0
+    tests: list = field(default_factory=list)
+    subcounters: "Counters" = field(default_factory=lambda: Counters())
+
+    def append(self, test: str = ""):
+        self.quantity += 1
+        if test:
+            self.tests.append(test)
+
+    def has_subcounters(self):
+        return bool(self.subcounters.counters)
+
+
+@dataclass
+class Counters:
+    counters: dict = field(default_factory=dict)
+
+    def add_counter(self, key: str, test: str = "") -> None:
+        self.counters[key] = self.counters.get(key, TestCollection())
+        self.counters[key].append(test)
+
+    def print_counters(self, indent: int = 0):
+        for key, value in self.counters.items():
+            print(f'{" " * indent}{value.quantity:4}    {key}')
+            if value.has_subcounters():
+                value.subcounters.print_counters(indent + 4)
+
+    def sort_by_quantity(self):
+        self.counters = dict(
+            sorted(self.counters.items(), key=lambda item: item[1].quantity, reverse=True)
+        )
+        for value in self.counters.values():
+            if value.has_subcounters():
+                value.subcounters.sort_by_quantity()
+
+    def get_next_entry(self, depth: int = 0, max_depth: int = 10):
+        for key, value in self.counters.items():
+            yield depth, value.quantity, key, ", ".join(value.tests[0:100])
+            if value.has_subcounters() and depth < max_depth:
+                yield from value.subcounters.get_next_entry(depth + 1, max_depth)
+
+    def _flatten(self):
+        for key, value in self.counters.items():
+            if value.has_subcounters():
+                yield from value.subcounters._flatten()
+            else:
+                yield key, value
+
+    def get_most_common(self, n: int = 10):
+        return dict(
+            sorted(self._flatten(), key=lambda item: item[1].quantity, reverse=True)[:n]
+        )
+
+
+class TwisterReports:
+    def __init__(self):
+        self.status: Counters = Counters()
+        self.errors: Counters = Counters()
+        self.platforms: Counters = Counters()
+
+    def parse_report(self, json_filename):
+        logger.info(f"Process {json_filename}")
+        with open(json_filename) as fh:
+            json_data = json.load(fh)
+        for ts in json_data.get("testsuites", []):
+            self.parse_statuses(ts)
+        for ts in json_data.get("testsuites", []):
+            self.parse_testsuite(ts)
+
+    def parse_statuses(self, testsuite):
+        ts_status = testsuite.get("status", "no status in testsuite")
+        self.status.add_counter(ts_status)
+        for tc in testsuite.get("testcases", []):
+            tc_status = tc.get("status")
+            self.status.counters[ts_status].subcounters.add_counter(tc_status)
+
+    def parse_testsuite(self, testsuite):
+        ts_status = testsuite.get("status") or "no status in testsuite"
+        if ts_status not in ("error", "failed"):
+            return
+        ts_platform = testsuite.get("platform") or "Unknown platform"
+        self.platforms.add_counter(ts_platform)
+        ts_reason = testsuite.get("reason") or "Unknown reason"
+        ts_log = testsuite.get("log")
+        test_identifier = f'{testsuite.get("platform")}:{testsuite.get("name")}'
+        if ts_reason.startswith("CMake build failure"):
+            reason = "CMake build failure"
+            self.errors.add_counter(reason)
+            error_key = ts_reason.split(reason, 1)[-1].lstrip(" -")
+            if not error_key:
+                error_key = self._parse_cmake_build_failure(ts_log)
+            self.errors.counters[reason].subcounters.add_counter(error_key, test_identifier)
+            ts_reason = reason
+        elif ts_reason.startswith("Build failure"):
+            reason = "Build failure"
+            self.errors.add_counter(reason)
+            error_key = ts_reason.split(reason, 1)[-1].lstrip(" -")
+            if not error_key:
+                error_key = self._parse_build_failure(ts_log)
+            self.errors.counters[reason].subcounters.add_counter(error_key, test_identifier)
+            ts_reason = reason
+        else:
+            self.errors.add_counter(ts_reason)
+        for tc in testsuite.get("testcases", []):
+            tc_reason = tc.get("reason")
+            tc_log = tc.get("log")
+            if tc_reason and tc_log:
+                self.errors.counters[ts_reason].subcounters.add_counter(
+                    tc_reason, test_identifier
+                )
+        if not self.errors.counters[ts_reason].has_subcounters():
+            self.errors.counters[ts_reason].tests.append(test_identifier)
+
+    def _parse_cmake_build_failure(self, log: str | None) -> str:
+        if not log:
+            return "No matching CMake error pattern found"
+        last_warning = "no warning found"
+        lines = log.splitlines()
+        for i, line in enumerate(lines):
+            if "warning: " in line:
+                last_warning = line
+            elif "devicetree error: " in line:
+                return "devicetree error"
+            elif "fatal error: " in line:
+                return line[line.index("fatal error: "):].strip()
+            elif "error: " in line:
+                if "undefined symbol" in last_warning:
+                    return last_warning[last_warning.index("undefined symbol"):].strip()
+                return last_warning
+            elif "CMake Error at" in line:
+                for next_line in lines[i + 1:]:
+                    if next_line.strip():
+                        return line + " " + next_line
+                return line
+        return "No matching CMake error pattern found"
+
+    def _parse_build_failure(self, log: str | None) -> str:
+        if not log:
+            return "No matching build error pattern found"
+        last_warning = ""
+        lines = log.splitlines()
+        for i, line in enumerate(lines):
+            if "undefined reference" in line:
+                return line[line.index("undefined reference"):].strip()
+            elif "error: ld returned" in line:
+                if last_warning:
+                    return last_warning
+                elif i > 0 and "overflowed by" in lines[i - 1]:
+                    return "ld.bfd: region overflowed"
+                elif i > 0 and "ld.bfd: warning: " in lines[i - 1]:
+                    return "ld.bfd:" + lines[i - 1].split("ld.bfd:", 1)[-1]
+                return line
+            elif "error: " in line:
+                return line[line.index("error: "):].strip()
+            elif ": in function " in line:
+                last_warning = line[line.index("in function"):].strip()
+        return "No matching build error pattern found"
+
+    def sort_counters(self):
+        self.status.sort_by_quantity()
+        self.platforms.sort_by_quantity()
+        self.errors.sort_by_quantity()
+
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if is_dataclass(o):
+            return asdict(o)
+        return super().default(o)
+
+
+# ---------------------------------------------------------------------------
+# gh CLI helpers
+# ---------------------------------------------------------------------------
+
+
+def gh(*args, check=True, capture=True):
+    """Run a gh CLI sub-command and return its stdout as a string."""
+    cmd = ["gh"] + list(args)
+    logger.debug("Running: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+    return result.stdout.strip() if capture else None
+
+
+def gh_json(*args):
+    """Run gh with --json flag and return parsed JSON."""
+    raw = gh(*args)
+    return json.loads(raw) if raw else []
+
+
+def resolve_run_id(args):
+    """
+    Determine the GitHub Actions workflow run ID from command-line options.
+
+    Priority: --run-id > --pr > --branch (latest run on branch).
+    """
+    if args.run_id:
+        return str(args.run_id)
+
+    repo_flag = ["--repo", args.repo] if args.repo else []
+
+    if args.pr:
+        logger.info("Looking up latest twister run for PR #%s …", args.pr)
+        try:
+            runs = gh_json(
+                "run", "list",
+                "--workflow", WORKFLOW_FILE,
+                "--event", "pull_request",
+                "--json", "databaseId,headBranch,event,status,conclusion",
+                "--limit", "20",
+                *repo_flag,
+            )
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: gh run list failed: {exc}")
+
+        pr_info = gh_json(
+            "pr", "view", str(args.pr),
+            "--json", "headRefName",
+            *repo_flag,
+        )
+        head_branch = pr_info.get("headRefName", "")
+        for run in runs:
+            if run.get("headBranch") == head_branch:
+                run_id = str(run["databaseId"])
+                logger.info("Found run %s for PR #%s (branch %s)", run_id, args.pr, head_branch)
+                return run_id
+        sys.exit(
+            f"ERROR: No twister workflow run found for PR #{args.pr} "
+            f"(head branch: {head_branch})"
+        )
+
+    branch = args.branch or "main"
+    logger.info("Looking up latest twister run on branch '%s' …", branch)
+    try:
+        runs = gh_json(
+            "run", "list",
+            "--workflow", WORKFLOW_FILE,
+            "--branch", branch,
+            "--json", "databaseId,status,conclusion",
+            "--limit", "5",
+            *repo_flag,
+        )
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"ERROR: gh run list failed: {exc}")
+
+    if not runs:
+        sys.exit(f"ERROR: No twister workflow runs found on branch '{branch}'")
+
+    run_id = str(runs[0]["databaseId"])
+    logger.info("Using latest run %s on branch '%s'", run_id, branch)
+    return run_id
+
+
+# ---------------------------------------------------------------------------
+# Artifact download
+# ---------------------------------------------------------------------------
+
+
+def download_artifacts(run_id: str, dest_dir: Path, repo: str | None) -> list[Path]:
+    """
+    Download all 'Unit Test Results (Subset N)' artifacts for *run_id*
+    into *dest_dir*.  Returns a list of directories, one per artifact.
+    """
+    repo_flag = ["--repo", repo] if repo else []
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Downloading artifacts for run %s into %s …", run_id, dest_dir)
+    try:
+        gh(
+            "run", "download", run_id,
+            "--pattern", f"{ARTIFACT_NAME_PREFIX}*",
+            "--dir", str(dest_dir),
+            *repo_flag,
+            capture=False,
+        )
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"ERROR: Artifact download failed: {exc}")
+
+    artifact_dirs = [p for p in dest_dir.iterdir() if p.is_dir()]
+    logger.info("Downloaded %d artifact(s)", len(artifact_dirs))
+    return artifact_dirs
+
+
+# ---------------------------------------------------------------------------
+# JSON / XML collection and merge
+# ---------------------------------------------------------------------------
+
+
+def collect_json_files(artifact_dirs: list[Path]) -> list[Path]:
+    """Walk artifact directories and return all twister.json files found."""
+    files = []
+    for artifact_dir in artifact_dirs:
+        for path in artifact_dir.rglob("twister.json"):
+            files.append(path)
+    return files
+
+
+def collect_xml_files(artifact_dirs: list[Path]) -> list[Path]:
+    """Walk artifact directories and return all twister.xml files found."""
+    files = []
+    for artifact_dir in artifact_dirs:
+        for path in artifact_dir.rglob("twister.xml"):
+            files.append(path)
+    return files
+
+
+def merge_json_files(json_files: list[Path], output_path: Path) -> dict:
+    """
+    Merge multiple twister.json files into a single combined JSON document.
+
+    The top-level 'testsuites' arrays are concatenated; scalar metadata
+    fields (run_id, version, …) are taken from the first file.
+    """
+    merged: dict = {}
+    total_suites = []
+
+    for json_file in json_files:
+        logger.info("Merging %s", json_file)
+        with open(json_file) as fh:
+            data = json.load(fh)
+        if not merged:
+            merged = {k: v for k, v in data.items() if k != "testsuites"}
+        total_suites.extend(data.get("testsuites", []))
+
+    merged["testsuites"] = total_suites
+
+    with open(output_path, "w") as fh:
+        json.dump(merged, fh, indent=2)
+    logger.info("Merged %d JSON file(s) → %s", len(json_files), output_path)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
+
+
+def dump_to_json(filename: Path, data: dict):
+    with open(filename, "w") as fh:
+        json.dump(data, fh, indent=4, cls=EnhancedJSONEncoder)
+    logger.info("Report saved to %s", filename)
+
+
+def dump_to_csv(filename: Path, data: Counters):
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Depth", "Counter", "Key", "Tests"])
+        for row in data.get_next_entry():
+            writer.writerow(row)
+    logger.info("CSV report saved to %s", filename)
+
+
+def dump_markdown_table(filename: Path, data: Counters, max_depth: int = 2):
+    with open(filename, "w", newline="") as fh:
+        for depth, quantity, key, _ in data.get_next_entry(max_depth=max_depth):
+            if depth == 0:
+                fh.write("\n")
+            fh.write(f"| {quantity:4} | {key} |\n")
+            if depth == 0:
+                fh.write("|-------|------|\n")
+    logger.info("Markdown table saved to %s", filename)
+
+
+def summary_with_most_common_errors(errors: Counters, limit: int = 15):
+    print("\nMost common errors summary:")
+    for key, value in errors.get_most_common(n=limit).items():
+        print(f"{value.quantity:4}    {key}")
+
+
+def print_run_summary(run_id: str, json_files: list[Path], merged_path: Path):
+    """Print a brief header summarising the run before the error details."""
+    print(f"\n{'=' * 70}")
+    print(f"  Twister Report  —  run {run_id}")
+    print(f"{'=' * 70}")
+    print(f"  Artifacts processed : {len(json_files)} twister.json file(s)")
+    print(f"  Merged JSON         : {merged_path}")
+    print(f"{'=' * 70}\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gh twister-report",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+        description="Download twister CI artifacts and generate a failure report.",
+        epilog=textwrap.dedent(
+            """
+            Examples:
+              gh twister-report --run-id 1234567890
+              gh twister-report --pr 12345
+              gh twister-report --branch main --long-summary
+              gh twister-report --no-download --artifacts-dir ./my-artifacts
+            """
+        ),
+    )
+
+    src = parser.add_argument_group("run selection (mutually exclusive)")
+    src_ex = src.add_mutually_exclusive_group()
+    src_ex.add_argument(
+        "--run-id",
+        metavar="ID",
+        help="GitHub Actions workflow run ID",
+    )
+    src_ex.add_argument(
+        "--pr",
+        metavar="NUMBER",
+        type=int,
+        help="Pull-request number; uses the most recent twister run for that PR",
+    )
+    src_ex.add_argument(
+        "--branch",
+        metavar="NAME",
+        help="Branch name; uses the most recent twister run (default: main)",
+    )
+
+    dl = parser.add_argument_group("download options")
+    dl.add_argument(
+        "--repo",
+        metavar="OWNER/REPO",
+        help="GitHub repository (default: current repo detected by gh)",
+    )
+    dl.add_argument(
+        "--artifacts-dir",
+        metavar="DIR",
+        default="twister-artifacts",
+        help="Directory to download/read artifacts (default: twister-artifacts)",
+    )
+    dl.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Skip download; use artifacts already present in --artifacts-dir",
+    )
+    dl.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Do not delete the artifact directory after analysis",
+    )
+
+    out = parser.add_argument_group("output options")
+    out.add_argument(
+        "--merged-json",
+        metavar="FILE",
+        default="twister_merged.json",
+        help="Path for the merged twister JSON file (default: twister_merged.json)",
+    )
+    out.add_argument(
+        "--output",
+        metavar="FILE",
+        default="twister_report_summary.json",
+        help="Path for the analysis summary JSON (default: twister_report_summary.json)",
+    )
+    out.add_argument(
+        "--output-csv",
+        metavar="FILE",
+        help="Also write a CSV error summary to this file",
+    )
+    out.add_argument(
+        "--output-md",
+        metavar="FILE",
+        help="Also write a Markdown error table to this file",
+    )
+    out.add_argument(
+        "--long-summary",
+        action="store_true",
+        help="Print all matched errors grouped by reason (default: top-15 only)",
+    )
+    out.add_argument(
+        "--status",
+        action="store_true",
+        help="Print testsuite/testcase status counters",
+    )
+    out.add_argument(
+        "--platforms",
+        action="store_true",
+        help="Print error counts grouped by platform",
+    )
+
+    parser.add_argument(
+        "-ll",
+        "--log-level",
+        type=str.upper,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity (default: INFO)",
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+
+    logging.basicConfig(level=args.log_level, format="%(levelname)-8s:  %(message)s")
+
+    artifacts_dir = Path(args.artifacts_dir)
+
+    if args.no_download:
+        if not artifacts_dir.exists():
+            sys.exit(f"ERROR: --no-download set but '{artifacts_dir}' does not exist")
+        artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
+        run_id = args.run_id or "unknown"
+        logger.info("Using existing artifacts in %s (%d dir(s))", artifacts_dir, len(artifact_dirs))
+    else:
+        run_id = resolve_run_id(args)
+        artifact_dirs = download_artifacts(run_id, artifacts_dir, args.repo)
+
+    json_files = collect_json_files(artifact_dirs)
+    if not json_files:
+        sys.exit("ERROR: No twister.json files found in downloaded artifacts")
+
+    xml_files = collect_xml_files(artifact_dirs)
+    logger.info(
+        "Found %d twister.json and %d twister.xml file(s)",
+        len(json_files),
+        len(xml_files),
+    )
+
+    merged_path = Path(args.merged_json)
+    merged_data = merge_json_files(json_files, merged_path)
+
+    print_run_summary(run_id, json_files, merged_path)
+
+    reports = TwisterReports()
+    reports.parse_report(merged_path)
+    reports.sort_counters()
+
+    summary_data = {
+        "status": reports.status,
+        "platforms": reports.platforms,
+        "errors": reports.errors,
+    }
+
+    dump_to_json(Path(args.output), summary_data)
+    print(f"Analysis summary written to: {args.output}")
+
+    if args.status:
+        print("\nTestsuites and testcases status summary:")
+        reports.status.print_counters()
+
+    if not reports.errors.counters:
+        print("\nNo failures found.")
+    else:
+        if args.platforms and reports.platforms.counters:
+            print("\nErrors per platform:")
+            reports.platforms.print_counters()
+
+        if args.long_summary:
+            print("\nErrors summary:")
+            reports.errors.print_counters()
+        else:
+            summary_with_most_common_errors(reports.errors)
+
+        if args.output_csv:
+            dump_to_csv(Path(args.output_csv), reports.errors)
+
+        if args.output_md:
+            dump_markdown_table(Path(args.output_md), reports.errors)
+
+    if not args.keep_artifacts and not args.no_download:
+        logger.info("Removing artifact directory %s", artifacts_dir)
+        shutil.rmtree(artifacts_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
