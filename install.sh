@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install the gh-twister-report extension into the gh CLI.
+# Install (or upgrade) the gh-twister-report extension into the gh CLI.
 #
-# gh extension install requires the source directory to be a git repository.
-# This script creates a temporary git repo, installs from it, then cleans up.
+# The gh CLI discovers extensions by scanning ~/.local/share/gh/extensions/.
+# This script creates a directory there and places a symlink pointing back to
+# the live source file, so any future edit to gh-twister-report takes effect
+# immediately — no reinstall needed.
 #
 # Usage (from anywhere inside the Zephyr tree):
 #   ./scripts/ci/gh-twister-report/install.sh
@@ -15,27 +17,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TMPDIR_EXT="$(mktemp -d)"
+EXT_NAME="twister-report"
+EXT_DIR="${HOME}/.local/share/gh/extensions/gh-${EXT_NAME}"
 
-cleanup() {
-    rm -rf "${TMPDIR_EXT}"
-}
-trap cleanup EXIT
+mkdir -p "${EXT_DIR}"
 
-EXTDIR="${TMPDIR_EXT}/gh-twister-report"
-mkdir -p "${EXTDIR}"
+# Symlink the live source file so edits are reflected immediately.
+ln -sf "${SCRIPT_DIR}/gh-${EXT_NAME}" "${EXT_DIR}/gh-${EXT_NAME}"
 
-cp "${SCRIPT_DIR}/gh-twister-report" "${EXTDIR}/gh-twister-report"
-chmod +x "${EXTDIR}/gh-twister-report"
-
-git -C "${EXTDIR}" init -q
-git -C "${EXTDIR}" add gh-twister-report
-git -C "${EXTDIR}" \
-    -c user.email="install@localhost" \
-    -c user.name="installer" \
-    commit -q -m "gh-twister-report extension"
-
-gh extension install "${EXTDIR}"
-
-echo "Installed: gh twister-report"
-echo "Run 'gh twister-report --help' to get started."
+echo "Installed:  gh ${EXT_NAME}"
+echo "Source:     ${SCRIPT_DIR}/gh-${EXT_NAME}"
+echo "Edits to that file take effect immediately — no reinstall needed."
+echo ""
+echo "Run: gh twister-report --help"

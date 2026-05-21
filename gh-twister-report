@@ -139,6 +139,8 @@ def print_visual_summary(
     reports: "TwisterReports",
     long_summary: bool = False,
     show_platforms: bool = False,
+    show_failures: bool = False,
+    failures_limit: int = 50,
 ) -> None:
     """Render the full visual report to stdout."""
     tw = _tw()
@@ -217,6 +219,10 @@ def print_visual_summary(
     if show_platforms and reports.platforms.counters:
         _print_platforms_table(reports.platforms, col_w, bar_w, failed_total)
 
+    # ── Failing tests list ───────────────────────────────────────────────────
+    if show_failures:
+        _print_failing_tests(testsuites, col_w, limit=failures_limit)
+
     # ── Footer ───────────────────────────────────────────────────────────────
     print(f"{C.DIM}{'─' * tw}{C.RESET}")
     # Outcome indicator
@@ -231,6 +237,87 @@ def print_visual_summary(
         verdict = f"{bg}{C.BOLD}  {pct_pass:.1f}% passed  {C.RESET}"
     print(f"  {verdict}  {C.DIM}passed={pass_count:,}  failed={failed_total:,}  "
           f"total={total:,}{C.RESET}")
+    print()
+
+
+def _print_failing_tests(
+    testsuites: list,
+    col_w: int,
+    limit: int = 50,
+) -> None:
+    """Print a table of every testsuite that failed or errored."""
+    failures = [
+        ts for ts in testsuites
+        if ts.get("status") in ("failed", "error")
+    ]
+    if not failures:
+        return
+
+    total_fail = len(failures)
+    shown = failures if limit == 0 else failures[:limit]
+
+    # ── Dynamic column widths ────────────────────────────────────────────────
+    # Layout: │ PLATFORM │ TESTSUITE │ ST │ REASON │
+    # Fixed overhead: 2 outer + 3 inner separators of " │ " (3 chars each) = 11
+    overhead = 11
+    avail = max(40, col_w - overhead)
+    plat_w  = min(24, max(8,  int(avail * 0.20)))
+    stat_w  = 7
+    name_w  = int(avail * 0.40)
+    reas_w  = max(10, avail - plat_w - stat_w - name_w)
+
+    sep_top = (
+        "┌" + "─" * (plat_w + 2) + "┬"
+        + "─" * (name_w + 2) + "┬"
+        + "─" * (stat_w + 2) + "┬"
+        + "─" * (reas_w + 2) + "┐"
+    )
+    sep_mid = (
+        "├" + "─" * (plat_w + 2) + "┼"
+        + "─" * (name_w + 2) + "┼"
+        + "─" * (stat_w + 2) + "┼"
+        + "─" * (reas_w + 2) + "┤"
+    )
+    sep_bot = (
+        "└" + "─" * (plat_w + 2) + "┴"
+        + "─" * (name_w + 2) + "┴"
+        + "─" * (stat_w + 2) + "┴"
+        + "─" * (reas_w + 2) + "┘"
+    )
+
+    def row(plat, name, stat, reason, hdr=False):
+        col = f"{C.BOLD}{C.DIM}" if hdr else _status_colour(stat)
+        stat_str = stat[:stat_w].ljust(stat_w)
+        return (
+            f"│ {plat[:plat_w].ljust(plat_w)} "
+            f"│ {name[:name_w].ljust(name_w)} "
+            f"│ {col}{stat_str}{C.RESET} "
+            f"│ {reason[:reas_w].ljust(reas_w)} │"
+        )
+
+    caption = (
+        f"showing {len(shown):,} of {total_fail:,}"
+        if limit and total_fail > limit
+        else f"{total_fail:,} total"
+    )
+    print(f"{C.BOLD}  FAILING TESTS{C.RESET}  "
+          f"{C.BRED}{C.BOLD}{total_fail:,}{C.RESET} "
+          f"{C.DIM}({caption}){C.RESET}")
+    print("  " + sep_top)
+    print("  " + row("PLATFORM", "TESTSUITE", "STATUS", "REASON", hdr=True))
+    print("  " + sep_mid)
+    for ts in shown:
+        plat   = ts.get("platform") or ""
+        name   = ts.get("name") or ""
+        status = ts.get("status") or ""
+        reason = (ts.get("reason") or "").splitlines()[0]  # first line only
+        print("  " + row(plat, name, status, reason))
+    print("  " + sep_bot)
+    if limit and total_fail > limit:
+        print(
+            f"  {C.DIM}  … {total_fail - limit:,} more."
+            f" Use --failures-limit 0 to show all.{C.RESET}"
+        )
     print()
 
 
@@ -566,6 +653,40 @@ def resolve_run_id(args) -> str:
         )
 
     branch = args.branch or "main"
+
+    if args.scheduled:
+        logger.info(
+            "Looking up latest scheduled twister run on branch '%s' …", branch
+        )
+        try:
+            runs = gh_json(
+                "run", "list",
+                "--workflow", WORKFLOW_FILE,
+                "--event", "schedule",
+                "--branch", branch,
+                "--json", "databaseId,status,conclusion,createdAt",
+                "--limit", "10",
+                *repo_flag,
+            )
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: gh run list failed: {exc}")
+
+        if not runs:
+            sys.exit(
+                f"ERROR: No scheduled twister runs found on branch '{branch}'.\n"
+                f"       Scheduled runs only exist on the main repo "
+                f"(zephyrproject-rtos/zephyr).\n"
+                f"       Pass --repo zephyrproject-rtos/zephyr if needed."
+            )
+
+        run_id = str(runs[0]["databaseId"])
+        created = runs[0].get("createdAt", "unknown date")
+        logger.info(
+            "Using latest scheduled run %s on '%s' (created %s)",
+            run_id, branch, created,
+        )
+        return run_id
+
     logger.info("Looking up latest twister run on branch '%s' …", branch)
     try:
         runs = gh_json(
@@ -718,6 +839,8 @@ def create_parser() -> argparse.ArgumentParser:
             Examples:
               gh twister-report --run-id 1234567890
               gh twister-report --pr 12345
+              gh twister-report --scheduled
+              gh twister-report --scheduled --branch v4.2-branch
               gh twister-report --branch main --long-summary
               gh twister-report --no-download --artifacts-dir ./my-artifacts
             """
@@ -730,8 +853,12 @@ def create_parser() -> argparse.ArgumentParser:
                         help="GitHub Actions workflow run ID")
     src_ex.add_argument("--pr", metavar="NUMBER", type=int,
                         help="PR number; uses the most recent twister run for that PR")
-    src_ex.add_argument("--branch", metavar="NAME",
-                        help="Branch name; uses the most recent twister run (default: main)")
+    src_ex.add_argument("--scheduled", action="store_true",
+                        help="Use the most recent scheduled (weekly) twister run")
+
+    src.add_argument("--branch", metavar="NAME",
+                     help="Branch to search; used with --scheduled or as the run source "
+                          "when no other selector is given (default: main)")
 
     dl = parser.add_argument_group("download options")
     dl.add_argument("--repo", metavar="OWNER/REPO",
@@ -741,9 +868,7 @@ def create_parser() -> argparse.ArgumentParser:
     dl.add_argument("--no-download", action="store_true",
                     help="Skip download; use artifacts already present in --artifacts-dir")
     dl.add_argument("--force-download", action="store_true",
-                    help="Re-download artifacts even if a cached copy already exists")
-    dl.add_argument("--keep-artifacts", action="store_true",
-                    help="Do not delete the artifact directory after analysis")
+                    help="Wipe --artifacts-dir and re-download even if a cached copy exists")
 
     out = parser.add_argument_group("output options")
     out.add_argument("--merged-json", metavar="FILE", default="twister_merged.json",
@@ -758,6 +883,10 @@ def create_parser() -> argparse.ArgumentParser:
                      help="Show all matched errors grouped by reason (default: top-15)")
     out.add_argument("--platforms", action="store_true",
                      help="Show error counts grouped by platform")
+    out.add_argument("--failures", action="store_true",
+                     help="Show a table of every failing/erroring testsuite")
+    out.add_argument("--failures-limit", metavar="N", type=int, default=50,
+                     help="Max failing tests to display; 0 = unlimited (default: 50)")
     out.add_argument("--no-color", action="store_true",
                      help="Disable coloured output")
 
@@ -796,16 +925,27 @@ def main():
         logger.info(
             "Using existing artifacts in %s (%d dir(s))", artifacts_dir, len(artifact_dirs)
         )
-    elif not args.force_download and has_cached_artifacts(artifacts_dir):
-        run_id = cached_run_id(artifacts_dir) or args.run_id or "cached"
-        artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
-        print(
-            f"{C.DIM}Using cached artifacts in '{artifacts_dir}' (run {run_id}). "
-            f"Pass --force-download to re-download.{C.RESET}"
-        )
     else:
+        # Always resolve the target run ID first so we can compare against the cache.
         run_id = resolve_run_id(args)
-        artifact_dirs = download_artifacts(run_id, artifacts_dir, args.repo)
+        cached = cached_run_id(artifacts_dir)
+
+        if not args.force_download and cached == run_id and has_cached_artifacts(artifacts_dir):
+            artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
+            print(
+                f"{C.DIM}Using cached artifacts for run {run_id}. "
+                f"Pass --force-download to re-download.{C.RESET}"
+            )
+        else:
+            if cached and cached != run_id:
+                print(
+                    f"{C.DIM}Cached run {cached} differs from requested run {run_id} "
+                    f"— re-downloading.{C.RESET}"
+                )
+            if artifacts_dir.exists():
+                logger.info("Removing stale artifacts dir …")
+                shutil.rmtree(artifacts_dir)
+            artifact_dirs = download_artifacts(run_id, artifacts_dir, args.repo)
 
     json_files = collect_json_files(artifact_dirs)
     if not json_files:
@@ -832,6 +972,8 @@ def main():
         reports=reports,
         long_summary=args.long_summary,
         show_platforms=args.platforms,
+        show_failures=args.failures,
+        failures_limit=args.failures_limit,
     )
 
     # Persist machine-readable output
@@ -850,10 +992,6 @@ def main():
     if args.output_md:
         dump_markdown_table(Path(args.output_md), reports.errors)
         print(f"{C.DIM}Markdown table written to: {args.output_md}{C.RESET}")
-
-    if not args.keep_artifacts and not args.no_download and args.force_download:
-        logger.info("Removing artifact directory %s", artifacts_dir)
-        shutil.rmtree(artifacts_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
