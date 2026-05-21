@@ -5,8 +5,7 @@
 # Install the gh-twister-report extension into the gh CLI.
 #
 # gh extension install requires the source directory to be a git repository.
-# This script creates a temporary bare clone of this directory, installs it,
-# then cleans up the temporary directory.
+# This script creates a temporary git repo, installs from it, then cleans up.
 #
 # Usage (from anywhere inside the Zephyr tree):
 #   ./scripts/ci/gh-twister-report/install.sh
@@ -16,14 +15,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TMPDIR="$(mktemp -d)"
+TMPDIR_EXT="$(mktemp -d)"
 
 cleanup() {
-    rm -rf "${TMPDIR}"
+    rm -rf "${TMPDIR_EXT}"
 }
 trap cleanup EXIT
 
-EXTDIR="${TMPDIR}/gh-twister-report"
+EXTDIR="${TMPDIR_EXT}/gh-twister-report"
 mkdir -p "${EXTDIR}"
 
 cp "${SCRIPT_DIR}/gh-twister-report" "${EXTDIR}/gh-twister-report"

@@ -3,7 +3,7 @@
 A [`gh`](https://cli.github.com/) CLI extension for the Zephyr project that
 downloads artifacts from the [`twister.yaml`](../../../.github/workflows/twister.yaml)
 workflow, merges the individual `twister.json` files into a single combined
-document, and generates a failure report.
+document, and generates a failure report with a rich terminal visual summary.
 
 The analysis logic mirrors
 [`scripts/ci/twister_report_analyzer.py`](../twister_report_analyzer.py).
@@ -20,8 +20,7 @@ The analysis logic mirrors
 ## Installation
 
 `gh extension install` requires the source directory to be its own git
-repository.  Use the provided `install.sh` helper, which creates a temporary
-git repo and installs from it automatically:
+repository. Use the provided helper script which handles this automatically:
 
 ```sh
 # From the Zephyr repository root:
@@ -31,8 +30,8 @@ git repo and installs from it automatically:
 cd scripts/ci/gh-twister-report && ./install.sh
 ```
 
-Alternatively, place (or symlink) the `gh-twister-report` executable anywhere
-on your `$PATH` — the `gh` CLI will discover it automatically:
+Alternatively, place (or symlink) the executable anywhere on your `$PATH` —
+the `gh` CLI will discover it automatically:
 
 ```sh
 ln -s "$PWD/scripts/ci/gh-twister-report/gh-twister-report" ~/.local/bin/gh-twister-report
@@ -71,10 +70,10 @@ gh twister-report [run selection] [download options] [output options]
 | `--output FILE` | `twister_report_summary.json` | Path for the analysis summary JSON |
 | `--output-csv FILE` | — | Also write a CSV error summary |
 | `--output-md FILE` | — | Also write a Markdown error table |
-| `--long-summary` | — | Print all matched errors (default: top-15 only) |
-| `--status` | — | Print testsuite/testcase status counters |
-| `--platforms` | — | Print error counts grouped by platform |
-| `-ll LEVEL` | `INFO` | Log verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL |
+| `--long-summary` | — | Show all matched errors (default: top-15 only) |
+| `--platforms` | — | Show error counts grouped by platform |
+| `--no-color` | — | Disable coloured terminal output |
+| `-ll LEVEL` | `WARNING` | Log verbosity: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 
 ---
 
@@ -87,7 +86,7 @@ gh twister-report --run-id 1234567890
 # Report for the latest twister run on PR #12345
 gh twister-report --pr 12345
 
-# Full verbose report on the main branch, save CSV and Markdown
+# Full report with platform breakdown, save CSV and Markdown
 gh twister-report --branch main \
     --long-summary --platforms \
     --output-csv errors.csv \
@@ -95,6 +94,38 @@ gh twister-report --branch main \
 
 # Re-analyse already-downloaded artifacts without hitting the API
 gh twister-report --no-download --artifacts-dir ./twister-artifacts --long-summary
+```
+
+---
+
+## Sample output
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TWISTER REPORT  —  run 1234567890  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Artifacts: 25 subset(s)   Total testsuites: 12,450   Merged JSON: twister_merged.json
+
+  STATUS SUMMARY
+  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ passed      9,823   78.9%  ████████████████████████████████████████████████████████░░░░░░░░░░ │
+  │ failed      1,204    9.7%  ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ error         312    2.5%  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ skipped       876    7.0%  █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ filtered      235    1.9%  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  └────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  FAILURE BREAKDOWN  1,516 testsuite(s) with errors/failures
+  ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  COUNT  REASON                                                                                 │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │    412  Build failure                                         27.2%  ████████░░░░░░░░░░░░░░░░ │
+  │    298  CMake build failure                                   19.7%  █████░░░░░░░░░░░░░░░░░░░ │
+  │    187  Timeout                                               12.3%  ███░░░░░░░░░░░░░░░░░░░░░ │
+  └────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+──────────────────────────────────────────────────────────────────────────────────────────────────
+  [ 78.9% passed ]  passed=9,823  failed=1,516  total=12,450
 ```
 
 ---

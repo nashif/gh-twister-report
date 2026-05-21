@@ -8,39 +8,27 @@ Downloads artifacts from the twister workflow (twister.json and twister.xml
 files), merges them into a single combined JSON file, and generates a failure
 report using the same analysis logic as scripts/ci/twister_report_analyzer.py.
 
-Installation (from the Zephyr repo root):
-    gh extension install ./scripts/ci/gh-twister-report
+Installation:
+    ./scripts/ci/gh-twister-report/install.sh
 
 Usage examples:
-    # Report for a specific workflow run ID
     gh twister-report --run-id 1234567890
-
-    # Report for the latest twister run on a PR
     gh twister-report --pr 12345
-
-    # Report for the latest twister run on a branch
-    gh twister-report --branch main
-
-    # Report using already-downloaded artifacts (skip download)
+    gh twister-report --branch main --long-summary
     gh twister-report --no-download --artifacts-dir ./my-artifacts
-
-    # Full verbose report saved to a custom file
-    gh twister-report --run-id 1234567890 --long-summary --output report.json
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
-import zipfile
+from collections import Counter
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 
@@ -49,10 +37,257 @@ logger = logging.getLogger(__name__)
 WORKFLOW_FILE = "twister.yaml"
 ARTIFACT_NAME_PREFIX = "Unit Test Results"
 
+# ---------------------------------------------------------------------------
+# Terminal / colour helpers
+# ---------------------------------------------------------------------------
+
+# Honour NO_COLOR (https://no-color.org/) and non-TTY output
+_COLOUR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class C:
+    """ANSI colour codes — empty strings when colour is disabled."""
+
+    if _COLOUR:
+        RESET = "\033[0m"
+        BOLD = "\033[1m"
+        DIM = "\033[2m"
+        RED = "\033[31m"
+        GREEN = "\033[32m"
+        YELLOW = "\033[33m"
+        BLUE = "\033[34m"
+        CYAN = "\033[36m"
+        WHITE = "\033[37m"
+        BRED = "\033[91m"
+        BGREEN = "\033[92m"
+        BYELLOW = "\033[93m"
+        BBLUE = "\033[94m"
+        BCYAN = "\033[96m"
+        BWHITE = "\033[97m"
+        BG_RED = "\033[41m"
+        BG_GREEN = "\033[42m"
+        BG_YELLOW = "\033[43m"
+        BG_BLUE = "\033[44m"
+    else:
+        RESET = BOLD = DIM = ""
+        RED = GREEN = YELLOW = BLUE = CYAN = WHITE = ""
+        BRED = BGREEN = BYELLOW = BBLUE = BCYAN = BWHITE = ""
+        BG_RED = BG_GREEN = BG_YELLOW = BG_BLUE = ""
+
+
+def _tw() -> int:
+    """Return terminal width, defaulting to 100."""
+    try:
+        return min(shutil.get_terminal_size().columns, 120)
+    except Exception:
+        return 100
+
+
+def _bar(value: int, total: int, width: int, colour: str = "") -> str:
+    """Render a horizontal bar proportional to value/total."""
+    if total == 0:
+        filled = 0
+    else:
+        filled = max(0, min(width, round(value / total * width)))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{colour}{bar}{C.RESET}" if colour else bar
+
+
+# Status → colour mapping
+_STATUS_COLOUR = {
+    "passed": C.BGREEN,
+    "failed": C.BRED,
+    "error": C.BYELLOW,
+    "skipped": C.CYAN,
+    "filtered": C.DIM,
+    "blocked": C.YELLOW,
+}
+
+
+def _status_colour(status: str) -> str:
+    return _STATUS_COLOUR.get(status.lower(), C.WHITE)
+
+
+# ---------------------------------------------------------------------------
+# Visual summary renderer
+# ---------------------------------------------------------------------------
+
+
+def _hline(w: int, left: str = "├", mid: str = "─", right: str = "┤") -> str:
+    return left + mid * (w - 2) + right
+
+
+def _box_top(w: int) -> str:
+    return "┌" + "─" * (w - 2) + "┐"
+
+
+def _box_bot(w: int) -> str:
+    return "└" + "─" * (w - 2) + "┘"
+
+
+def _box_row(text: str, w: int, colour: str = "") -> str:
+    inner = w - 4
+    padded = text[:inner].ljust(inner)
+    return f"│ {colour}{padded}{C.RESET} │"
+
+
+def print_visual_summary(
+    run_id: str,
+    json_files: list[Path],
+    merged_path: Path,
+    merged_data: dict,
+    reports: "TwisterReports",
+    long_summary: bool = False,
+    show_platforms: bool = False,
+) -> None:
+    """Render the full visual report to stdout."""
+    tw = _tw()
+    testsuites = merged_data.get("testsuites", [])
+    total = len(testsuites)
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    title = f"  TWISTER REPORT  —  run {run_id}  "
+    pad = max(0, tw - len(title) - 2)
+    print()
+    print(f"{C.BOLD}{C.BWHITE}{'━' * tw}{C.RESET}")
+    print(f"{C.BOLD}{C.BWHITE}{title}{'━' * pad}{C.RESET}")
+    print(f"{C.BOLD}{C.BWHITE}{'━' * tw}{C.RESET}")
+    print(
+        f"  {C.DIM}Artifacts:{C.RESET} {len(json_files)} subset(s)   "
+        f"{C.DIM}Total testsuites:{C.RESET} {C.BOLD}{total:,}{C.RESET}   "
+        f"{C.DIM}Merged JSON:{C.RESET} {merged_path}"
+    )
+    print()
+
+    # ── Status summary ───────────────────────────────────────────────────────
+    status_counts: Counter = Counter()
+    for ts in testsuites:
+        status_counts[ts.get("status", "unknown")] += 1
+
+    col_w = tw
+    bar_w = max(20, col_w - 32)
+
+    print(f"{C.BOLD}  STATUS SUMMARY{C.RESET}")
+    print("  " + _box_top(col_w - 2))
+
+    order = ["passed", "failed", "error", "skipped", "filtered", "blocked"]
+    all_statuses = order + [s for s in status_counts if s not in order]
+
+    for status in all_statuses:
+        count = status_counts.get(status, 0)
+        if count == 0:
+            continue
+        pct = count / total * 100 if total else 0
+        col = _status_colour(status)
+        bar = _bar(count, total, bar_w, col)
+        label = status.ljust(10)
+        row = f"{col}{C.BOLD}{label}{C.RESET}  {count:6,}  {pct:5.1f}%  {bar}"
+        print("  " + _box_row(row, col_w - 2))
+
+    print("  " + _box_bot(col_w - 2))
+    print()
+
+    # ── Failure breakdown ────────────────────────────────────────────────────
+    if not reports.errors.counters:
+        print(f"  {C.BGREEN}{C.BOLD}No failures found.{C.RESET}")
+        print()
+        return
+
+    failed_total = sum(
+        status_counts.get(s, 0) for s in ("failed", "error")
+    )
+
+    print(f"{C.BOLD}  FAILURE BREAKDOWN{C.RESET}  "
+          f"{C.BRED}{C.BOLD}{failed_total:,}{C.RESET} testsuite(s) with errors/failures")
+    print("  " + _box_top(col_w - 2))
+    print("  " + _box_row(
+        f"{'COUNT':>6}  {'REASON'}", col_w - 2, colour=f"{C.BOLD}{C.DIM}"
+    ))
+    print("  " + _hline(col_w - 2))
+
+    if long_summary:
+        _print_errors_tree(reports.errors, col_w, bar_w, failed_total)
+    else:
+        _print_top_errors(reports.errors, col_w, bar_w, failed_total)
+
+    print("  " + _box_bot(col_w - 2))
+    print()
+
+    # ── Platforms ────────────────────────────────────────────────────────────
+    if show_platforms and reports.platforms.counters:
+        _print_platforms_table(reports.platforms, col_w, bar_w, failed_total)
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    print(f"{C.DIM}{'─' * tw}{C.RESET}")
+    # Outcome indicator
+    pass_count = status_counts.get("passed", 0)
+    if failed_total == 0:
+        verdict = f"{C.BG_GREEN}{C.BOLD}  ALL PASS  {C.RESET}"
+    elif pass_count == 0:
+        verdict = f"{C.BG_RED}{C.BOLD}  ALL FAIL  {C.RESET}"
+    else:
+        pct_pass = pass_count / total * 100 if total else 0
+        bg = C.BG_GREEN if pct_pass >= 90 else C.BG_YELLOW if pct_pass >= 70 else C.BG_RED
+        verdict = f"{bg}{C.BOLD}  {pct_pass:.1f}% passed  {C.RESET}"
+    print(f"  {verdict}  {C.DIM}passed={pass_count:,}  failed={failed_total:,}  "
+          f"total={total:,}{C.RESET}")
+    print()
+
+
+def _print_top_errors(errors: "Counters", col_w: int, bar_w: int, total: int, n: int = 15):
+    for key, value in errors.get_most_common(n=n).items():
+        count = value.quantity
+        pct = count / total * 100 if total else 0
+        bar = _bar(count, total, bar_w // 2, C.BRED)
+        label = key[:col_w - 26]
+        row = f"{C.BRED}{C.BOLD}{count:6,}{C.RESET}  {label:<{col_w - 26}}  {pct:4.1f}%  {bar}"
+        print("  " + _box_row(row, col_w - 2))
+
+
+def _print_errors_tree(errors: "Counters", col_w: int, bar_w: int, total: int, indent: int = 0):
+    for key, value in errors.counters.items():
+        count = value.quantity
+        pct = count / total * 100 if total else 0
+        bar = _bar(count, total, bar_w // 2, C.BRED if indent == 0 else C.YELLOW)
+        col = f"{C.BRED}{C.BOLD}" if indent == 0 else f"{C.YELLOW}"
+        prefix = "  " * indent
+        max_key = col_w - 28 - len(prefix)
+        label = key[:max(10, max_key)]
+        row = (
+            f"{col}{count:6,}{C.RESET}  {prefix}{label:<{max(10, max_key)}}  "
+            f"{pct:4.1f}%  {bar}"
+        )
+        print("  " + _box_row(row, col_w - 2))
+        if value.has_subcounters():
+            _print_errors_tree(value.subcounters, col_w, bar_w, total, indent + 1)
+
+
+def _print_platforms_table(platforms: "Counters", col_w: int, bar_w: int, total: int):
+    print(f"{C.BOLD}  TOP FAILING PLATFORMS{C.RESET}")
+    print("  " + _box_top(col_w - 2))
+    print("  " + _box_row(
+        f"{'COUNT':>6}  {'PLATFORM'}", col_w - 2, colour=f"{C.BOLD}{C.DIM}"
+    ))
+    print("  " + _hline(col_w - 2))
+    sorted_plats = sorted(
+        platforms.counters.items(), key=lambda x: x[1].quantity, reverse=True
+    )
+    for key, value in sorted_plats[:20]:
+        count = value.quantity
+        pct = count / total * 100 if total else 0
+        bar = _bar(count, total, bar_w // 2, C.BYELLOW)
+        label = key[:col_w - 26]
+        row = (
+            f"{C.BYELLOW}{C.BOLD}{count:6,}{C.RESET}  {label:<{col_w - 26}}  "
+            f"{pct:4.1f}%  {bar}"
+        )
+        print("  " + _box_row(row, col_w - 2))
+    print("  " + _box_bot(col_w - 2))
+    print()
+
 
 # ---------------------------------------------------------------------------
 # Inline analysis logic (mirrors scripts/ci/twister_report_analyzer.py)
-# so the extension works without needing to locate the Zephyr source tree.
 # ---------------------------------------------------------------------------
 
 
@@ -253,12 +488,8 @@ def gh_json(*args):
     return json.loads(raw) if raw else []
 
 
-def resolve_run_id(args):
-    """
-    Determine the GitHub Actions workflow run ID from command-line options.
-
-    Priority: --run-id > --pr > --branch (latest run on branch).
-    """
+def resolve_run_id(args) -> str:
+    """Determine the workflow run ID from CLI options."""
     if args.run_id:
         return str(args.run_id)
 
@@ -267,6 +498,12 @@ def resolve_run_id(args):
     if args.pr:
         logger.info("Looking up latest twister run for PR #%s …", args.pr)
         try:
+            pr_info = gh_json(
+                "pr", "view", str(args.pr),
+                "--json", "headRefName",
+                *repo_flag,
+            )
+            head_branch = pr_info.get("headRefName", "")
             runs = gh_json(
                 "run", "list",
                 "--workflow", WORKFLOW_FILE,
@@ -276,18 +513,14 @@ def resolve_run_id(args):
                 *repo_flag,
             )
         except subprocess.CalledProcessError as exc:
-            sys.exit(f"ERROR: gh run list failed: {exc}")
+            sys.exit(f"ERROR: gh CLI call failed: {exc}")
 
-        pr_info = gh_json(
-            "pr", "view", str(args.pr),
-            "--json", "headRefName",
-            *repo_flag,
-        )
-        head_branch = pr_info.get("headRefName", "")
         for run in runs:
             if run.get("headBranch") == head_branch:
                 run_id = str(run["databaseId"])
-                logger.info("Found run %s for PR #%s (branch %s)", run_id, args.pr, head_branch)
+                logger.info(
+                    "Found run %s for PR #%s (branch %s)", run_id, args.pr, head_branch
+                )
                 return run_id
         sys.exit(
             f"ERROR: No twister workflow run found for PR #{args.pr} "
@@ -322,14 +555,9 @@ def resolve_run_id(args):
 
 
 def download_artifacts(run_id: str, dest_dir: Path, repo: str | None) -> list[Path]:
-    """
-    Download all 'Unit Test Results (Subset N)' artifacts for *run_id*
-    into *dest_dir*.  Returns a list of directories, one per artifact.
-    """
+    """Download 'Unit Test Results (Subset N)' artifacts into dest_dir."""
     repo_flag = ["--repo", repo] if repo else []
-
     dest_dir.mkdir(parents=True, exist_ok=True)
-
     logger.info("Downloading artifacts for run %s into %s …", run_id, dest_dir)
     try:
         gh(
@@ -353,33 +581,23 @@ def download_artifacts(run_id: str, dest_dir: Path, repo: str | None) -> list[Pa
 
 
 def collect_json_files(artifact_dirs: list[Path]) -> list[Path]:
-    """Walk artifact directories and return all twister.json files found."""
     files = []
-    for artifact_dir in artifact_dirs:
-        for path in artifact_dir.rglob("twister.json"):
-            files.append(path)
+    for d in artifact_dirs:
+        files.extend(d.rglob("twister.json"))
     return files
 
 
 def collect_xml_files(artifact_dirs: list[Path]) -> list[Path]:
-    """Walk artifact directories and return all twister.xml files found."""
     files = []
-    for artifact_dir in artifact_dirs:
-        for path in artifact_dir.rglob("twister.xml"):
-            files.append(path)
+    for d in artifact_dirs:
+        files.extend(d.rglob("twister.xml"))
     return files
 
 
 def merge_json_files(json_files: list[Path], output_path: Path) -> dict:
-    """
-    Merge multiple twister.json files into a single combined JSON document.
-
-    The top-level 'testsuites' arrays are concatenated; scalar metadata
-    fields (run_id, version, …) are taken from the first file.
-    """
+    """Merge multiple twister.json files — concatenate 'testsuites' arrays."""
     merged: dict = {}
-    total_suites = []
-
+    total_suites: list = []
     for json_file in json_files:
         logger.info("Merging %s", json_file)
         with open(json_file) as fh:
@@ -387,9 +605,7 @@ def merge_json_files(json_files: list[Path], output_path: Path) -> dict:
         if not merged:
             merged = {k: v for k, v in data.items() if k != "testsuites"}
         total_suites.extend(data.get("testsuites", []))
-
     merged["testsuites"] = total_suites
-
     with open(output_path, "w") as fh:
         json.dump(merged, fh, indent=2)
     logger.info("Merged %d JSON file(s) → %s", len(json_files), output_path)
@@ -397,7 +613,7 @@ def merge_json_files(json_files: list[Path], output_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Reporting helpers
+# Output helpers (JSON / CSV / Markdown)
 # ---------------------------------------------------------------------------
 
 
@@ -427,22 +643,6 @@ def dump_markdown_table(filename: Path, data: Counters, max_depth: int = 2):
     logger.info("Markdown table saved to %s", filename)
 
 
-def summary_with_most_common_errors(errors: Counters, limit: int = 15):
-    print("\nMost common errors summary:")
-    for key, value in errors.get_most_common(n=limit).items():
-        print(f"{value.quantity:4}    {key}")
-
-
-def print_run_summary(run_id: str, json_files: list[Path], merged_path: Path):
-    """Print a brief header summarising the run before the error details."""
-    print(f"\n{'=' * 70}")
-    print(f"  Twister Report  —  run {run_id}")
-    print(f"{'=' * 70}")
-    print(f"  Artifacts processed : {len(json_files)} twister.json file(s)")
-    print(f"  Merged JSON         : {merged_path}")
-    print(f"{'=' * 70}\n")
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -467,94 +667,42 @@ def create_parser() -> argparse.ArgumentParser:
 
     src = parser.add_argument_group("run selection (mutually exclusive)")
     src_ex = src.add_mutually_exclusive_group()
-    src_ex.add_argument(
-        "--run-id",
-        metavar="ID",
-        help="GitHub Actions workflow run ID",
-    )
-    src_ex.add_argument(
-        "--pr",
-        metavar="NUMBER",
-        type=int,
-        help="Pull-request number; uses the most recent twister run for that PR",
-    )
-    src_ex.add_argument(
-        "--branch",
-        metavar="NAME",
-        help="Branch name; uses the most recent twister run (default: main)",
-    )
+    src_ex.add_argument("--run-id", metavar="ID",
+                        help="GitHub Actions workflow run ID")
+    src_ex.add_argument("--pr", metavar="NUMBER", type=int,
+                        help="PR number; uses the most recent twister run for that PR")
+    src_ex.add_argument("--branch", metavar="NAME",
+                        help="Branch name; uses the most recent twister run (default: main)")
 
     dl = parser.add_argument_group("download options")
-    dl.add_argument(
-        "--repo",
-        metavar="OWNER/REPO",
-        help="GitHub repository (default: current repo detected by gh)",
-    )
-    dl.add_argument(
-        "--artifacts-dir",
-        metavar="DIR",
-        default="twister-artifacts",
-        help="Directory to download/read artifacts (default: twister-artifacts)",
-    )
-    dl.add_argument(
-        "--no-download",
-        action="store_true",
-        help="Skip download; use artifacts already present in --artifacts-dir",
-    )
-    dl.add_argument(
-        "--keep-artifacts",
-        action="store_true",
-        help="Do not delete the artifact directory after analysis",
-    )
+    dl.add_argument("--repo", metavar="OWNER/REPO",
+                    help="GitHub repository (default: current repo detected by gh)")
+    dl.add_argument("--artifacts-dir", metavar="DIR", default="twister-artifacts",
+                    help="Directory to download/read artifacts (default: twister-artifacts)")
+    dl.add_argument("--no-download", action="store_true",
+                    help="Skip download; use artifacts already present in --artifacts-dir")
+    dl.add_argument("--keep-artifacts", action="store_true",
+                    help="Do not delete the artifact directory after analysis")
 
     out = parser.add_argument_group("output options")
-    out.add_argument(
-        "--merged-json",
-        metavar="FILE",
-        default="twister_merged.json",
-        help="Path for the merged twister JSON file (default: twister_merged.json)",
-    )
-    out.add_argument(
-        "--output",
-        metavar="FILE",
-        default="twister_report_summary.json",
-        help="Path for the analysis summary JSON (default: twister_report_summary.json)",
-    )
-    out.add_argument(
-        "--output-csv",
-        metavar="FILE",
-        help="Also write a CSV error summary to this file",
-    )
-    out.add_argument(
-        "--output-md",
-        metavar="FILE",
-        help="Also write a Markdown error table to this file",
-    )
-    out.add_argument(
-        "--long-summary",
-        action="store_true",
-        help="Print all matched errors grouped by reason (default: top-15 only)",
-    )
-    out.add_argument(
-        "--status",
-        action="store_true",
-        help="Print testsuite/testcase status counters",
-    )
-    out.add_argument(
-        "--platforms",
-        action="store_true",
-        help="Print error counts grouped by platform",
-    )
+    out.add_argument("--merged-json", metavar="FILE", default="twister_merged.json",
+                     help="Path for the merged twister JSON (default: twister_merged.json)")
+    out.add_argument("--output", metavar="FILE", default="twister_report_summary.json",
+                     help="Path for the analysis summary JSON (default: twister_report_summary.json)")
+    out.add_argument("--output-csv", metavar="FILE",
+                     help="Also write a CSV error summary to this file")
+    out.add_argument("--output-md", metavar="FILE",
+                     help="Also write a Markdown error table to this file")
+    out.add_argument("--long-summary", action="store_true",
+                     help="Show all matched errors grouped by reason (default: top-15)")
+    out.add_argument("--platforms", action="store_true",
+                     help="Show error counts grouped by platform")
+    out.add_argument("--no-color", action="store_true",
+                     help="Disable coloured output")
 
-    parser.add_argument(
-        "-ll",
-        "--log-level",
-        type=str.upper,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity (default: INFO)",
-    )
-
+    parser.add_argument("-ll", "--log-level", type=str.upper, default="WARNING",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        help="Logging verbosity (default: WARNING)")
     return parser
 
 
@@ -569,14 +717,24 @@ def main():
 
     logging.basicConfig(level=args.log_level, format="%(levelname)-8s:  %(message)s")
 
+    # Allow --no-color to override TTY detection at runtime
+    if args.no_color:
+        global _COLOUR
+        _COLOUR = False
+        for attr in vars(C):
+            if not attr.startswith("_"):
+                setattr(C, attr, "")
+
     artifacts_dir = Path(args.artifacts_dir)
 
     if args.no_download:
         if not artifacts_dir.exists():
             sys.exit(f"ERROR: --no-download set but '{artifacts_dir}' does not exist")
         artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
-        run_id = args.run_id or "unknown"
-        logger.info("Using existing artifacts in %s (%d dir(s))", artifacts_dir, len(artifact_dirs))
+        run_id = args.run_id or "local"
+        logger.info(
+            "Using existing artifacts in %s (%d dir(s))", artifacts_dir, len(artifact_dirs)
+        )
     else:
         run_id = resolve_run_id(args)
         artifact_dirs = download_artifacts(run_id, artifacts_dir, args.repo)
@@ -587,51 +745,43 @@ def main():
 
     xml_files = collect_xml_files(artifact_dirs)
     logger.info(
-        "Found %d twister.json and %d twister.xml file(s)",
-        len(json_files),
-        len(xml_files),
+        "Found %d twister.json and %d twister.xml file(s)", len(json_files), len(xml_files)
     )
 
     merged_path = Path(args.merged_json)
     merged_data = merge_json_files(json_files, merged_path)
 
-    print_run_summary(run_id, json_files, merged_path)
-
     reports = TwisterReports()
     reports.parse_report(merged_path)
     reports.sort_counters()
 
+    # Visual summary on the terminal
+    print_visual_summary(
+        run_id=run_id,
+        json_files=json_files,
+        merged_path=merged_path,
+        merged_data=merged_data,
+        reports=reports,
+        long_summary=args.long_summary,
+        show_platforms=args.platforms,
+    )
+
+    # Persist machine-readable output
     summary_data = {
         "status": reports.status,
         "platforms": reports.platforms,
         "errors": reports.errors,
     }
-
     dump_to_json(Path(args.output), summary_data)
-    print(f"Analysis summary written to: {args.output}")
+    print(f"{C.DIM}Analysis summary written to: {args.output}{C.RESET}")
 
-    if args.status:
-        print("\nTestsuites and testcases status summary:")
-        reports.status.print_counters()
+    if args.output_csv:
+        dump_to_csv(Path(args.output_csv), reports.errors)
+        print(f"{C.DIM}CSV written to: {args.output_csv}{C.RESET}")
 
-    if not reports.errors.counters:
-        print("\nNo failures found.")
-    else:
-        if args.platforms and reports.platforms.counters:
-            print("\nErrors per platform:")
-            reports.platforms.print_counters()
-
-        if args.long_summary:
-            print("\nErrors summary:")
-            reports.errors.print_counters()
-        else:
-            summary_with_most_common_errors(reports.errors)
-
-        if args.output_csv:
-            dump_to_csv(Path(args.output_csv), reports.errors)
-
-        if args.output_md:
-            dump_markdown_table(Path(args.output_md), reports.errors)
+    if args.output_md:
+        dump_markdown_table(Path(args.output_md), reports.errors)
+        print(f"{C.DIM}Markdown table written to: {args.output_md}{C.RESET}")
 
     if not args.keep_artifacts and not args.no_download:
         logger.info("Removing artifact directory %s", artifacts_dir)
