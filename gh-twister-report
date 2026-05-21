@@ -554,6 +554,9 @@ def resolve_run_id(args) -> str:
 # ---------------------------------------------------------------------------
 
 
+RUN_ID_FILE = ".run_id"
+
+
 def download_artifacts(run_id: str, dest_dir: Path, repo: str | None) -> list[Path]:
     """Download 'Unit Test Results (Subset N)' artifacts into dest_dir."""
     repo_flag = ["--repo", repo] if repo else []
@@ -570,9 +573,27 @@ def download_artifacts(run_id: str, dest_dir: Path, repo: str | None) -> list[Pa
     except subprocess.CalledProcessError as exc:
         sys.exit(f"ERROR: Artifact download failed: {exc}")
 
+    # Persist the run ID so subsequent invocations can display it without re-downloading
+    (dest_dir / RUN_ID_FILE).write_text(run_id)
+
     artifact_dirs = [p for p in dest_dir.iterdir() if p.is_dir()]
     logger.info("Downloaded %d artifact(s)", len(artifact_dirs))
     return artifact_dirs
+
+
+def cached_run_id(artifacts_dir: Path) -> str | None:
+    """Return the run ID stored by a previous download, or None."""
+    marker = artifacts_dir / RUN_ID_FILE
+    if marker.exists():
+        return marker.read_text().strip() or None
+    return None
+
+
+def has_cached_artifacts(artifacts_dir: Path) -> bool:
+    """Return True when artifacts_dir exists and contains at least one twister.json."""
+    if not artifacts_dir.is_dir():
+        return False
+    return any(artifacts_dir.rglob("twister.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +702,8 @@ def create_parser() -> argparse.ArgumentParser:
                     help="Directory to download/read artifacts (default: twister-artifacts)")
     dl.add_argument("--no-download", action="store_true",
                     help="Skip download; use artifacts already present in --artifacts-dir")
+    dl.add_argument("--force-download", action="store_true",
+                    help="Re-download artifacts even if a cached copy already exists")
     dl.add_argument("--keep-artifacts", action="store_true",
                     help="Do not delete the artifact directory after analysis")
 
@@ -731,9 +754,16 @@ def main():
         if not artifacts_dir.exists():
             sys.exit(f"ERROR: --no-download set but '{artifacts_dir}' does not exist")
         artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
-        run_id = args.run_id or "local"
+        run_id = cached_run_id(artifacts_dir) or args.run_id or "local"
         logger.info(
             "Using existing artifacts in %s (%d dir(s))", artifacts_dir, len(artifact_dirs)
+        )
+    elif not args.force_download and has_cached_artifacts(artifacts_dir):
+        run_id = cached_run_id(artifacts_dir) or args.run_id or "cached"
+        artifact_dirs = [p for p in artifacts_dir.iterdir() if p.is_dir()]
+        print(
+            f"{C.DIM}Using cached artifacts in '{artifacts_dir}' (run {run_id}). "
+            f"Pass --force-download to re-download.{C.RESET}"
         )
     else:
         run_id = resolve_run_id(args)
@@ -783,7 +813,7 @@ def main():
         dump_markdown_table(Path(args.output_md), reports.errors)
         print(f"{C.DIM}Markdown table written to: {args.output_md}{C.RESET}")
 
-    if not args.keep_artifacts and not args.no_download:
+    if not args.keep_artifacts and not args.no_download and args.force_download:
         logger.info("Removing artifact directory %s", artifacts_dir)
         shutil.rmtree(artifacts_dir, ignore_errors=True)
 
