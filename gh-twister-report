@@ -500,31 +500,69 @@ def resolve_run_id(args) -> str:
         try:
             pr_info = gh_json(
                 "pr", "view", str(args.pr),
-                "--json", "headRefName",
-                *repo_flag,
-            )
-            head_branch = pr_info.get("headRefName", "")
-            runs = gh_json(
-                "run", "list",
-                "--workflow", WORKFLOW_FILE,
-                "--event", "pull_request",
-                "--json", "databaseId,headBranch,event,status,conclusion",
-                "--limit", "20",
+                "--json", "headRefOid,headRefName,number",
                 *repo_flag,
             )
         except subprocess.CalledProcessError as exc:
-            sys.exit(f"ERROR: gh CLI call failed: {exc}")
+            sys.exit(f"ERROR: Could not fetch PR #{args.pr}: {exc}")
+
+        head_sha = pr_info.get("headRefOid", "")
+        head_branch = pr_info.get("headRefName", "")
+
+        if not head_sha:
+            sys.exit(f"ERROR: Could not determine head SHA for PR #{args.pr}")
+
+        # Search by exact commit SHA — reliable for both same-repo branches and forks.
+        logger.info("Searching for twister runs on commit %s …", head_sha[:12])
+        try:
+            runs = gh_json(
+                "run", "list",
+                "--workflow", WORKFLOW_FILE,
+                "--commit", head_sha,
+                "--json", "databaseId,status,conclusion,event,displayTitle",
+                "--limit", "10",
+                *repo_flag,
+            )
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: gh run list failed: {exc}")
+
+        if runs:
+            run_id = str(runs[0]["databaseId"])
+            logger.info(
+                "Found run %s for PR #%s (commit %s)", run_id, args.pr, head_sha[:12]
+            )
+            return run_id
+
+        # Fallback: search by branch name with a generous limit in case the commit
+        # SHA lookup returned nothing (e.g. older gh versions without --commit support).
+        logger.info(
+            "No run found by SHA, falling back to branch '%s' …", head_branch
+        )
+        try:
+            runs = gh_json(
+                "run", "list",
+                "--workflow", WORKFLOW_FILE,
+                "--branch", head_branch,
+                "--json", "databaseId,headSha,status,conclusion",
+                "--limit", "50",
+                *repo_flag,
+            )
+        except subprocess.CalledProcessError as exc:
+            sys.exit(f"ERROR: gh run list (branch fallback) failed: {exc}")
 
         for run in runs:
-            if run.get("headBranch") == head_branch:
+            if run.get("headSha", "").startswith(head_sha[:12]):
                 run_id = str(run["databaseId"])
                 logger.info(
-                    "Found run %s for PR #%s (branch %s)", run_id, args.pr, head_branch
+                    "Found run %s for PR #%s via branch fallback", run_id, args.pr
                 )
                 return run_id
+
         sys.exit(
-            f"ERROR: No twister workflow run found for PR #{args.pr} "
-            f"(head branch: {head_branch})"
+            f"ERROR: No twister workflow run found for PR #{args.pr}\n"
+            f"       head SHA:    {head_sha}\n"
+            f"       head branch: {head_branch}\n"
+            f"       Tip: pass --run-id <id> to specify the run directly."
         )
 
     branch = args.branch or "main"
