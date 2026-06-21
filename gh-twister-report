@@ -141,6 +141,8 @@ def print_visual_summary(
     show_platforms: bool = False,
     show_failures: bool = False,
     failures_limit: int = 50,
+    show_timing: bool = False,
+    timing_limit: int = 10,
 ) -> None:
     """Render the full visual report to stdout."""
     tw = _tw()
@@ -188,6 +190,10 @@ def print_visual_summary(
 
     print("  " + _box_bot(col_w - 2))
     print()
+
+    # ── Timing statistics ─────────────────────────────────────────────────────
+    if show_timing:
+        print_timing_stats(testsuites, col_w, bar_w, limit=timing_limit)
 
     # ── Failure breakdown ────────────────────────────────────────────────────
     if not reports.errors.counters:
@@ -347,6 +353,134 @@ def _print_errors_tree(errors: "Counters", col_w: int, bar_w: int, total: int, i
         print("  " + _box_row(row, col_w - 2))
         if value.has_subcounters():
             _print_errors_tree(value.subcounters, col_w, bar_w, total, indent + 1)
+
+
+def _fl(value) -> float:
+    """Parse a twister time field (string or number) into a float; 0.0 on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-friendly duration: seconds under a minute, else H:MM:SS / M:SS."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s"
+
+
+def _percentiles(values: list[float], ps: list[int]) -> dict:
+    """Return {p: value} nearest-rank percentiles for a sorted-able list."""
+    if not values:
+        return {p: 0.0 for p in ps}
+    s = sorted(values)
+    n = len(s)
+    out = {}
+    for p in ps:
+        idx = min(n - 1, max(0, int(round(p / 100 * n)) - 1))
+        out[p] = s[idx]
+    return out
+
+
+def print_timing_stats(
+    testsuites: list,
+    col_w: int,
+    bar_w: int,
+    limit: int = 10,
+) -> None:
+    """Render build/execution time statistics for all testsuites."""
+    builds = [_fl(ts.get("build_time")) for ts in testsuites]
+    execs = [_fl(ts.get("execution_time")) for ts in testsuites]
+    builds_nz = [b for b in builds if b > 0]
+    execs_nz = [e for e in execs if e > 0]
+
+    if not builds_nz and not execs_nz:
+        return
+
+    def _summary_rows(label: str, arr: list[float], colour: str):
+        rows = []
+        if not arr:
+            rows.append(f"{colour}{C.BOLD}{label:<10}{C.RESET}  {C.DIM}no data{C.RESET}")
+            return rows
+        n = len(arr)
+        total = sum(arr)
+        mean = total / n
+        pct = _percentiles(arr, [50, 90, 95, 99])
+        rows.append(
+            f"{colour}{C.BOLD}{label:<10}{C.RESET}  n={n:<6,}  "
+            f"total {C.BOLD}{_fmt_duration(total):>10}{C.RESET}  "
+            f"mean {mean:6.1f}s  max {max(arr):7.1f}s"
+        )
+        rows.append(
+            f"{C.DIM}            p50 {pct[50]:6.1f}s   p90 {pct[90]:6.1f}s   "
+            f"p95 {pct[95]:6.1f}s   p99 {pct[99]:6.1f}s{C.RESET}"
+        )
+        return rows
+
+    print(f"{C.BOLD}  TIMING STATISTICS{C.RESET}")
+    print("  " + _box_top(col_w - 2))
+    for r in _summary_rows("build", builds_nz, C.BBLUE):
+        print("  " + _box_row(r, col_w - 2))
+    for r in _summary_rows("execution", execs_nz, C.BCYAN):
+        print("  " + _box_row(r, col_w - 2))
+    print("  " + _box_bot(col_w - 2))
+    print()
+
+    # ── Per-architecture breakdown ────────────────────────────────────────────
+    arch_agg: dict = {}
+    for ts in testsuites:
+        a = ts.get("arch") or "unknown"
+        acc = arch_agg.setdefault(a, [0, 0.0, 0.0])
+        acc[0] += 1
+        acc[1] += _fl(ts.get("build_time"))
+        acc[2] += _fl(ts.get("execution_time"))
+
+    if arch_agg:
+        max_build = max(v[1] for v in arch_agg.values()) or 1
+        print(f"{C.BOLD}  BUILD TIME BY ARCH{C.RESET}")
+        print("  " + _box_top(col_w - 2))
+        header = f"{'ARCH':<10}{'COUNT':>7}  {'BUILD':>10}  {'EXEC':>9}"
+        print("  " + _box_row(header, col_w - 2, colour=f"{C.BOLD}{C.DIM}"))
+        print("  " + _hline(col_w - 2))
+        for a, (c, b, e) in sorted(arch_agg.items(), key=lambda x: -x[1][1]):
+            bar = _bar(int(b), int(max_build), bar_w // 2, C.BBLUE)
+            row = (
+                f"{C.BOLD}{a:<10}{C.RESET}{c:>7,}  "
+                f"{_fmt_duration(b):>10}  {_fmt_duration(e):>9}  {bar}"
+            )
+            print("  " + _box_row(row, col_w - 2))
+        print("  " + _box_bot(col_w - 2))
+        print()
+
+    # ── Slowest builds / executions ───────────────────────────────────────────
+    if limit > 0:
+        def _slowest(field: str, title: str, colour: str):
+            ranked = sorted(testsuites, key=lambda t: -_fl(t.get(field)))
+            ranked = [t for t in ranked if _fl(t.get(field)) > 0][:limit]
+            if not ranked:
+                return
+            print(f"{C.BOLD}  SLOWEST {title}{C.RESET}  {C.DIM}(top {len(ranked)}){C.RESET}")
+            print("  " + _box_top(col_w - 2))
+            for t in ranked:
+                dur = _fl(t.get(field))
+                name = (t.get("name") or "")[: col_w - 34]
+                plat = (t.get("platform") or "")[:24]
+                row = (
+                    f"{colour}{C.BOLD}{dur:8.1f}s{C.RESET}  "
+                    f"{name:<{col_w - 34}}  {C.DIM}{plat}{C.RESET}"
+                )
+                print("  " + _box_row(row, col_w - 2))
+            print("  " + _box_bot(col_w - 2))
+            print()
+
+        _slowest("build_time", "BUILDS", C.BBLUE)
+        _slowest("execution_time", "EXECUTIONS", C.BCYAN)
 
 
 def _print_platforms_table(platforms: "Counters", col_w: int, bar_w: int, total: int):
@@ -842,6 +976,7 @@ def create_parser() -> argparse.ArgumentParser:
               gh twister-report --scheduled
               gh twister-report --scheduled --branch v4.2-branch
               gh twister-report --branch main --long-summary
+              gh twister-report --no-download --timing
               gh twister-report --no-download --artifacts-dir ./my-artifacts
             """
         ),
@@ -887,6 +1022,12 @@ def create_parser() -> argparse.ArgumentParser:
                      help="Show a table of every failing/erroring testsuite")
     out.add_argument("--failures-limit", metavar="N", type=int, default=50,
                      help="Max failing tests to display; 0 = unlimited (default: 50)")
+    out.add_argument("--timing", action="store_true",
+                     help="Show build/execution time statistics (totals, percentiles, "
+                          "per-arch breakdown, slowest tests)")
+    out.add_argument("--timing-limit", metavar="N", type=int, default=10,
+                     help="Max slowest build/exec tests to display; 0 = hide list "
+                          "(default: 10)")
     out.add_argument("--no-color", action="store_true",
                      help="Disable coloured output")
 
@@ -974,6 +1115,8 @@ def main():
         show_platforms=args.platforms,
         show_failures=args.failures,
         failures_limit=args.failures_limit,
+        show_timing=args.timing,
+        timing_limit=args.timing_limit,
     )
 
     # Persist machine-readable output
